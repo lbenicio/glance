@@ -3,3 +3,5 @@
 /playground
 /.idea
 /glance*.yml
+fly.toml
+.DS_Store
