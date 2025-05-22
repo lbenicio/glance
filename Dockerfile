@@ -8,6 +8,7 @@ FROM alpine:3.21
 
 WORKDIR /app
 COPY --from=builder /app/glance .
+COPY ./glance.yml /app/config/glance.yml
 
 HEALTHCHECK --timeout=10s --start-period=60s --interval=60s \
   CMD wget --spider -q http://localhost:8080/api/healthz
