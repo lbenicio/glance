@@ -1,19 +1,16 @@
-FROM golang:1.24.2-alpine3.21 AS builder
+FROM golang:1.26.3-alpine3.22 AS builder
 
 WORKDIR /app
 COPY . /app
 RUN CGO_ENABLED=0 go build .
 
-FROM alpine:3.21
+FROM alpine:3.22
 
 WORKDIR /app
 COPY --from=builder /app/glance .
 COPY ./glance.yml /app/config/glance.yml
 RUN mkdir -p /app/assets
 RUN mkdir -p /mnt/configs
-
-HEALTHCHECK --timeout=10s --start-period=60s --interval=60s \
-  CMD wget --spider -q http://localhost:8080/api/healthz
 
 EXPOSE 8080/tcp
 ENTRYPOINT ["/app/glance", "--config", "/app/config/glance.yml"]
