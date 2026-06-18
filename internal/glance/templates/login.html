@@ -17,6 +17,24 @@
     <div class="flex grow items-center justify-center" style="padding-bottom: 5rem">
         <h1 class="visually-hidden">Login</h1>
         <main id="login-container" class="grow login-bounds" style="display: none;">
+            {{- if .OIDCProviders }}
+            <div class="oidc-login-section animate-entrance">
+                {{- range .OIDCProviders }}
+                <a href="{{ $.App.Config.Server.BaseURL }}/api/oidc/login/{{ .Name }}{{ if $.RedirectTo }}?redirect_to={{ $.RedirectTo }}{{ end }}" class="oidc-login-button login-button">
+                    <div>Login with {{ .Name }}</div>
+                    <svg stroke="currentColor" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" aria-hidden="true">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M13.5 4.5 21 12m0 0-7.5 7.5M21 12H3" />
+                    </svg>
+                </a>
+                {{- end }}
+            </div>
+            {{- if .App.Config.Auth.Users }}
+            <div class="oidc-separator">
+                <span>or</span>
+            </div>
+            {{- end }}
+            {{- end }}
+            {{- if .App.Config.Auth.Users }}
             <div class="animate-entrance">
                 <label class="form-label widget-header" for="username">Username</label>
                 <div class="form-input widget-content-frame padding-inline-widget flex gap-10 items-center">
@@ -46,6 +64,7 @@
                     <path stroke-linecap="round" stroke-linejoin="round" d="M13.5 4.5 21 12m0 0-7.5 7.5M21 12H3" />
                 </svg>
             </button>
+            {{- end }}
         </main>
     </div>
     {{ template "footer.html" . }}

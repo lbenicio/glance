@@ -37,8 +37,10 @@ type config struct {
 	} `yaml:"server"`
 
 	Auth struct {
-		SecretKey string           `yaml:"secret-key"`
-		Users     map[string]*user `yaml:"users"`
+		SecretKey     string           `yaml:"secret-key"`
+		Users         map[string]*user `yaml:"users"`
+		OIDCProviders []OIDCProvider   `yaml:"oidc-providers"`
+		OIDC          *OIDCProvider    `yaml:"oidc"`
 	} `yaml:"auth"`
 
 	Document struct {

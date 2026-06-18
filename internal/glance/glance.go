@@ -42,6 +42,7 @@ type application struct {
 	usernameHashToUsername map[string]string
 	authAttemptsMu         sync.Mutex
 	failedAuthAttempts     map[string]*failedAuthAttempt
+	oidcProviders          []OIDCProvider
 }
 
 func newApplication(c *config) (*application, error) {
@@ -58,7 +59,10 @@ func newApplication(c *config) (*application, error) {
 	// Init auth
 	//
 
-	if len(config.Auth.Users) > 0 {
+	hasUsers := len(config.Auth.Users) > 0
+	hasOIDC := len(config.Auth.OIDCProviders) > 0 || config.Auth.OIDC != nil
+
+	if hasUsers || hasOIDC {
 		secretBytes, err := base64.StdEncoding.DecodeString(config.Auth.SecretKey)
 		if err != nil {
 			return nil, fmt.Errorf("decoding secret-key: %v", err)
@@ -71,6 +75,7 @@ func newApplication(c *config) (*application, error) {
 		app.usernameHashToUsername = make(map[string]string)
 		app.failedAuthAttempts = make(map[string]*failedAuthAttempt)
 		app.RequiresAuth = true
+		app.authSecretKey = secretBytes
 
 		for username := range config.Auth.Users {
 			user := config.Auth.Users[username]
@@ -94,7 +99,21 @@ func newApplication(c *config) (*application, error) {
 			}
 		}
 
-		app.authSecretKey = secretBytes
+		// Collect OIDC providers from both oidc and oidc-providers config keys
+		var oidcProviders []OIDCProvider
+		if config.Auth.OIDC != nil {
+			oidcProviders = append(oidcProviders, *config.Auth.OIDC)
+		}
+		oidcProviders = append(oidcProviders, config.Auth.OIDCProviders...)
+
+		for i := range oidcProviders {
+			provider := &oidcProviders[i]
+			if err := provider.initOIDCProvider(); err != nil {
+				return nil, fmt.Errorf("initializing OIDC provider: %w", err)
+			}
+			provider.setRedirectURL(config.Server.BaseURL)
+		}
+		app.oidcProviders = oidcProviders
 	}
 
 	//
@@ -282,9 +301,11 @@ type templateRequestData struct {
 }
 
 type templateData struct {
-	App     *application
-	Page    *page
-	Request templateRequestData
+	App           *application
+	Page          *page
+	Request       templateRequestData
+	OIDCProviders []OIDCProvider
+	RedirectTo    string
 }
 
 func (a *application) populateTemplateRequestData(data *templateRequestData, r *http.Request) {
@@ -454,6 +475,12 @@ func (a *application) server() (func() error, func() error) {
 		mux.HandleFunc("GET /login", a.handleLoginPageRequest)
 		mux.HandleFunc("GET /logout", a.handleLogoutRequest)
 		mux.HandleFunc("POST /api/authenticate", a.handleAuthenticationAttempt)
+
+		// OIDC routes
+		if len(a.oidcProviders) > 0 {
+			mux.HandleFunc("GET /api/oidc/login/{provider}", a.handleOIDCLogin)
+			mux.HandleFunc("GET /api/oidc/callback/{provider}", a.handleOIDCCallback)
+		}
 	}
 
 	mux.Handle(

@@ -13,6 +13,7 @@ import (
 	"log"
 	mathrand "math/rand/v2"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -293,7 +294,11 @@ func (a *application) handleUnauthorizedResponse(w http.ResponseWriter, r *http.
 
 	switch fallback {
 	case redirectToLogin:
-		http.Redirect(w, r, a.Config.Server.BaseURL+"/login", http.StatusSeeOther)
+		loginURL := a.Config.Server.BaseURL + "/login"
+		if r.URL.Path != "" && r.URL.Path != "/" {
+			loginURL += "?redirect_to=" + url.QueryEscape(r.URL.RequestURI())
+		}
+		http.Redirect(w, r, loginURL, http.StatusSeeOther)
 	case showUnauthorizedJSON:
 		w.WriteHeader(http.StatusUnauthorized)
 		w.Write([]byte(`{"error": "Unauthorized"}`))
@@ -305,6 +310,15 @@ func (a *application) handleUnauthorizedResponse(w http.ResponseWriter, r *http.
 // Maybe this should be a POST request instead?
 func (a *application) handleLogoutRequest(w http.ResponseWriter, r *http.Request) {
 	a.setAuthSessionCookie(w, r, "", time.Now().Add(-1*time.Hour))
+	// Also clear OIDC state cookie if present
+	http.SetCookie(w, &http.Cookie{
+		Name:     OIDC_STATE_COOKIE_NAME,
+		Value:    "",
+		Expires:  time.Now().Add(-1 * time.Hour),
+		Path:     a.Config.Server.BaseURL + "/",
+		SameSite: http.SameSiteLaxMode,
+		HttpOnly: true,
+	})
 	http.Redirect(w, r, a.Config.Server.BaseURL+"/login", http.StatusSeeOther)
 }
 
@@ -326,8 +340,12 @@ func (a *application) handleLoginPageRequest(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	redirectTo := r.URL.Query().Get("redirect_to")
+
 	data := &templateData{
-		App: a,
+		App:           a,
+		OIDCProviders: a.oidcProviders,
+		RedirectTo:    redirectTo,
 	}
 	a.populateTemplateRequestData(&data.Request, r)
 
