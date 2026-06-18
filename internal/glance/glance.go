@@ -43,7 +43,7 @@ type application struct {
 	authAttemptsMu         sync.Mutex
 	failedAuthAttempts     map[string]*failedAuthAttempt
 	oidcProviders          []OIDCProvider
-	processedOIDCStates    sync.Map // map[string]bool, prevents authorization code replay
+	processedOIDCStates    sync.Map // map[string]*oidcSessionResult, prevents code replay + shares session between concurrent callbacks
 }
 
 func newApplication(c *config) (*application, error) {
