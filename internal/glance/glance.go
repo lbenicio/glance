@@ -43,6 +43,7 @@ type application struct {
 	authAttemptsMu         sync.Mutex
 	failedAuthAttempts     map[string]*failedAuthAttempt
 	oidcProviders          []OIDCProvider
+	processedOIDCStates    sync.Map // map[string]bool, prevents authorization code replay
 }
 
 func newApplication(c *config) (*application, error) {
@@ -76,6 +77,12 @@ func newApplication(c *config) (*application, error) {
 		app.failedAuthAttempts = make(map[string]*failedAuthAttempt)
 		app.RequiresAuth = true
 		app.authSecretKey = secretBytes
+
+		// Initialize the users map if nil (needed for OIDC-only setups where
+		// ensureOIDCUser adds users at runtime)
+		if config.Auth.Users == nil {
+			config.Auth.Users = make(map[string]*user)
+		}
 
 		for username := range config.Auth.Users {
 			user := config.Auth.Users[username]
@@ -114,6 +121,10 @@ func newApplication(c *config) (*application, error) {
 			provider.setRedirectURL(config.Server.BaseURL)
 		}
 		app.oidcProviders = oidcProviders
+
+		// Restore OIDC-created users from before a config reload (important
+		// for Kubernetes where ConfigMap mounts trigger spurious reloads).
+		app.restoreGlobalOIDCUsers()
 	}
 
 	//
@@ -253,36 +264,38 @@ func (p *page) updateOutdatedWidgets() {
 	now := time.Now()
 
 	var wg sync.WaitGroup
-	context := context.Background()
+	ctx := context.Background()
+
+	// Collect all outdated widgets first
+	var updates []widget
 
 	for w := range p.HeadWidgets {
-		widget := p.HeadWidgets[w]
-
-		if !widget.requiresUpdate(&now) {
-			continue
+		wgt := p.HeadWidgets[w]
+		if wgt.requiresUpdate(&now) {
+			updates = append(updates, wgt)
 		}
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			widget.update(context)
-		}()
 	}
 
 	for c := range p.Columns {
 		for w := range p.Columns[c].Widgets {
-			widget := p.Columns[c].Widgets[w]
-
-			if !widget.requiresUpdate(&now) {
-				continue
+			wgt := p.Columns[c].Widgets[w]
+			if wgt.requiresUpdate(&now) {
+				updates = append(updates, wgt)
 			}
-
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				widget.update(context)
-			}()
 		}
+	}
+
+	// Launch updates with a small stagger to avoid hammering rate-limited hosts
+	for i, u := range updates {
+		wg.Add(1)
+		go func(w widget, idx int) {
+			defer wg.Done()
+			// 50ms stagger between launches — spreads 70 requests over ~3.5s
+			if idx > 0 {
+				time.Sleep(time.Duration(idx) * 50 * time.Millisecond)
+			}
+			w.update(ctx)
+		}(u, i)
 	}
 
 	wg.Wait()
@@ -306,6 +319,7 @@ type templateData struct {
 	Request       templateRequestData
 	OIDCProviders []OIDCProvider
 	RedirectTo    string
+	LoginError    string
 }
 
 func (a *application) populateTemplateRequestData(data *templateRequestData, r *http.Request) {

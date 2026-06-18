@@ -17,6 +17,9 @@
     <div class="flex grow items-center justify-center" style="padding-bottom: 5rem">
         <h1 class="visually-hidden">Login</h1>
         <main id="login-container" class="grow login-bounds" style="display: none;">
+            {{- if .LoginError }}
+            <div class="login-error-message login-error-server animate-entrance" role="alert">{{ .LoginError }}</div>
+            {{- end }}
             {{- if .OIDCProviders }}
             <div class="oidc-login-section animate-entrance">
                 {{- range .OIDCProviders }}

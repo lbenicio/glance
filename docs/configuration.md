@@ -275,6 +275,127 @@ server:
 
 When set to `true`, Glance will use the `X-Forwarded-For` header to determine the original IP address of the request, so make sure that your reverse proxy is correctly configured to send that header.
 
+### OIDC / OAuth2 Authentication
+
+Glance supports Single Sign-On via OpenID Connect (OIDC) providers such as Google, Authentik, Authelia, Keycloak, and others. This allows users to log in using their existing identity provider accounts.
+
+#### Single provider
+
+Use the `oidc` key to configure a single OIDC provider:
+
+```yaml
+auth:
+  secret-key: # generated with secret:make
+  oidc:
+    name: "Google"
+    client-id: "your-client-id.apps.googleusercontent.com"
+    client-secret: "GOCSPX-..."
+    issuer-url: "https://accounts.google.com"
+```
+
+#### Multiple providers
+
+Use the `oidc-providers` key to configure multiple providers:
+
+```yaml
+auth:
+  secret-key: # generated with secret:make
+  oidc-providers:
+    - name: "Google"
+      client-id: "..."
+      client-secret: "..."
+      issuer-url: "https://accounts.google.com"
+    - name: "Authentik"
+      client-id: "..."
+      client-secret: "..."
+      issuer-url: "https://auth.example.com/application/o/glance"
+```
+
+#### Provider properties
+
+##### `name`
+
+The display name for the provider, shown on the login button (e.g. "Login with Google").
+
+##### `client-id`
+
+The OAuth2 client ID from your identity provider.
+
+##### `client-secret`
+
+The OAuth2 client secret from your identity provider.
+
+##### `issuer-url`
+
+The base URL of the OIDC provider. Glance will automatically discover the authorization and token endpoints via `/.well-known/openid-configuration`.
+
+##### `redirect-url`
+
+Optional. Override the automatically-generated redirect URL. By default this is `{base-url}/api/oidc/callback/{provider-name}`.
+
+##### `scopes`
+
+Optional. Custom OAuth2 scopes to request. Defaults to `[openid, profile, email]`. Useful when you need additional scopes such as `groups` for group membership validation:
+
+```yaml
+oidc:
+  name: "Authentik"
+  client-id: "..."
+  client-secret: "..."
+  issuer-url: "https://auth.example.com/application/o/glance"
+  scopes:
+    - openid
+    - profile
+    - email
+    - groups
+```
+
+##### `group-claim`
+
+Optional. The name of the claim in the ID token that contains the user's group memberships (e.g. `groups`). Used together with `groups` to restrict access to specific groups.
+
+##### `groups`
+
+Optional. A list of allowed group names. If configured, the user must belong to at least one of the listed groups. The group memberships are read from the claim specified by `group-claim`.
+
+```yaml
+oidc:
+  name: "Authentik"
+  client-id: "..."
+  client-secret: "..."
+  issuer-url: "https://auth.example.com/application/o/glance"
+  scopes:
+    - openid
+    - profile
+    - email
+    - groups
+  group-claim: "groups"
+  groups:
+    - admin
+    - glance-users
+```
+
+#### Combining OIDC with local users
+
+You can use both OIDC providers and local username/password users simultaneously. The login page will show OIDC login buttons above the username/password form with an "or" separator:
+
+```yaml
+auth:
+  secret-key: # generated with secret:make
+  oidc:
+    name: "Google"
+    client-id: "..."
+    client-secret: "..."
+    issuer-url: "https://accounts.google.com"
+  users:
+    admin:
+      password-hash: "$2a$10$..."
+```
+
+#### OIDC-only setup
+
+If only OIDC providers are configured (no `users`), the username/password form is hidden and only OIDC login buttons are shown.
+
 ## Server
 Server configuration is done through a top level `server` property. Example:
 

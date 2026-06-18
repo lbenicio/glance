@@ -41,6 +41,7 @@ type redditWidget struct {
 	Limit               int               `yaml:"limit"`
 	CollapseAfter       int               `yaml:"collapse-after"`
 	RequestURLTemplate  string            `yaml:"request-url-template"`
+	LoidCookie          string            `yaml:"loid-cookie"`
 
 	AppAuth struct {
 		Name   string `yaml:"name"`
@@ -219,12 +220,18 @@ func (widget *redditWidget) fetchSubredditPosts() (forumPostList, error) {
 	}
 	request.Header = headers
 
-	loid, err := getRedditLoidCookie()
-	if err != nil {
-		fmt.Printf("Error fetching reddit loid cookie: %v\n", err)
-		return nil, errors.New("could not solve reddit challenge")
+	// Use manually-configured loid cookie if provided (bypasses the JS challenge
+	// step, useful in cluster environments where the challenge fetch is blocked).
+	if widget.LoidCookie != "" {
+		request.AddCookie(&http.Cookie{Name: "loid", Value: widget.LoidCookie})
+	} else {
+		loid, err := getRedditLoidCookie()
+		if err != nil {
+			fmt.Printf("Error fetching reddit loid cookie: %v\n", err)
+			return nil, errors.New("could not solve reddit challenge")
+		}
+		request.AddCookie(&http.Cookie{Name: "loid", Value: loid})
 	}
-	request.AddCookie(&http.Cookie{Name: "loid", Value: loid})
 
 	responseJson, err := decodeJsonFromRequest[subredditResponseJson](client, request)
 	if err != nil {

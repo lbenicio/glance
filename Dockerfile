@@ -8,7 +8,7 @@ FROM alpine:3.22
 
 WORKDIR /app
 COPY --from=builder /app/glance .
-COPY ./glance.yml /app/config/glance.yml
+
 RUN mkdir -p /app/assets
 RUN mkdir -p /mnt/configs
 

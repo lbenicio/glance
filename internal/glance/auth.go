@@ -260,16 +260,23 @@ func (a *application) isAuthorized(w http.ResponseWriter, r *http.Request) bool 
 
 	usernameHash, shouldRegenerate, err := verifySessionToken(token.Value, a.authSecretKey, time.Now())
 	if err != nil {
+		// Log token verification failures to help diagnose session issues.
+		// Don't log the full token — just that verification failed and why.
+		if err.Error() != "token has expired" {
+			log.Printf("Session token verification failed: %v", err)
+		}
 		return false
 	}
 
 	username, exists := a.usernameHashToUsername[string(usernameHash)]
 	if !exists {
+		log.Printf("Session token references unknown username hash")
 		return false
 	}
 
 	_, exists = a.Config.Auth.Users[username]
 	if !exists {
+		log.Printf("Session token references user %q that no longer exists in config", username)
 		return false
 	}
 
@@ -323,11 +330,13 @@ func (a *application) handleLogoutRequest(w http.ResponseWriter, r *http.Request
 }
 
 func (a *application) setAuthSessionCookie(w http.ResponseWriter, r *http.Request, token string, expires time.Time) {
+	isSecure := r.TLS != nil || strings.ToLower(r.Header.Get("X-Forwarded-Proto")) == "https"
+
 	http.SetCookie(w, &http.Cookie{
 		Name:     AUTH_SESSION_COOKIE_NAME,
 		Value:    token,
 		Expires:  expires,
-		Secure:   strings.ToLower(r.Header.Get("X-Forwarded-Proto")) == "https",
+		Secure:   isSecure,
 		Path:     a.Config.Server.BaseURL + "/",
 		SameSite: http.SameSiteLaxMode,
 		HttpOnly: true,
@@ -341,11 +350,13 @@ func (a *application) handleLoginPageRequest(w http.ResponseWriter, r *http.Requ
 	}
 
 	redirectTo := r.URL.Query().Get("redirect_to")
+	loginError := loginErrorMessage(r.URL.Query().Get("error"))
 
 	data := &templateData{
 		App:           a,
 		OIDCProviders: a.oidcProviders,
 		RedirectTo:    redirectTo,
+		LoginError:    loginError,
 	}
 	a.populateTemplateRequestData(&data.Request, r)
 
@@ -358,4 +369,33 @@ func (a *application) handleLoginPageRequest(w http.ResponseWriter, r *http.Requ
 	}
 
 	w.Write(responseBytes.Bytes())
+}
+
+// loginErrorMessage maps an error code from the query string to a user-friendly message.
+func loginErrorMessage(code string) string {
+	switch code {
+	case "invalid_state", "state_mismatch":
+		return "Session expired or invalid. Please try logging in again."
+	case "token_exchange_failed":
+		return "Authentication failed while contacting the identity provider. Please try again."
+	case "invalid_id_token":
+		return "Received an invalid authentication response. Please try again."
+	case "missing_id_token", "missing_code":
+		return "Incomplete authentication response received. Please try again."
+	case "no_identity":
+		return "Could not determine your identity from the authentication response."
+	case "provider_error":
+		return "The identity provider returned an error. Please try again or contact your administrator."
+	case "unknown_provider":
+		return "The requested login provider is not configured."
+	case "session_error":
+		return "Failed to create a session. Please try again."
+	case "duplicate_request":
+		return "" // Silently ignore duplicate callbacks — the first one succeeded
+	default:
+		if code != "" {
+			return "An unexpected error occurred during authentication. Please try again."
+		}
+		return ""
+	}
 }

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -25,6 +26,13 @@ type OIDCProvider struct {
 	ClientSecret string `yaml:"client-secret"`
 	IssuerURL    string `yaml:"issuer-url"`
 	RedirectURL  string `yaml:"redirect-url"`
+
+	// Group membership validation
+	GroupClaim    string   `yaml:"group-claim"`
+	AllowedGroups []string `yaml:"groups"`
+
+	// Custom OAuth2 scopes (default: openid, profile, email)
+	Scopes []string `yaml:"scopes"`
 
 	// Cached provider metadata
 	oauth2Config *oauth2.Config
@@ -54,6 +62,39 @@ const (
 	OIDC_STATE_COOKIE_NAME = "oidc_state"
 	OIDC_STATE_COOKIE_TTL  = 10 * time.Minute
 )
+// Global registry of OIDC-created usernames that survives application recreations
+// (which happen on config reload — common in Kubernetes with ConfigMap mounts).
+var (
+	globalOIDCUsers   = make(map[string]bool)
+	globalOIDCUsersMu sync.Mutex
+)
+
+func addGlobalOIDCUser(username string) {
+	globalOIDCUsersMu.Lock()
+	globalOIDCUsers[username] = true
+	globalOIDCUsersMu.Unlock()
+}
+
+// restoreGlobalOIDCUsers pre-populates the application's user maps with OIDC users
+// that were created before a config reload. Must be called during newApplication
+// after authSecretKey and usernameHashToUsername are initialized.
+func (a *application) restoreGlobalOIDCUsers() {
+	globalOIDCUsersMu.Lock()
+	defer globalOIDCUsersMu.Unlock()
+
+	for username := range globalOIDCUsers {
+		if _, exists := a.Config.Auth.Users[username]; !exists {
+			a.Config.Auth.Users[username] = &user{}
+		}
+		usernameHash, err := computeUsernameHash(username, a.authSecretKey)
+		if err != nil {
+			log.Printf("Error restoring OIDC user %q hash: %v", username, err)
+			continue
+		}
+		a.usernameHashToUsername[string(usernameHash)] = username
+	}
+}
+
 
 // initOIDCProvider discovers the OIDC provider metadata and configures the oauth2 client.
 func (p *OIDCProvider) initOIDCProvider() error {
@@ -83,6 +124,11 @@ func (p *OIDCProvider) initOIDCProvider() error {
 		redirectURL = "__DYNAMIC__"
 	}
 
+	scopes := p.Scopes
+	if len(scopes) == 0 {
+		scopes = []string{"openid", "profile", "email"}
+	}
+
 	p.oauth2Config = &oauth2.Config{
 		ClientID:     p.ClientID,
 		ClientSecret: p.ClientSecret,
@@ -91,7 +137,7 @@ func (p *OIDCProvider) initOIDCProvider() error {
 			TokenURL: metadata.TokenEndpoint,
 		},
 		RedirectURL: redirectURL,
-		Scopes:      []string{"openid", "profile", "email"},
+		Scopes:      scopes,
 	}
 
 	return nil
@@ -269,7 +315,31 @@ func (a *application) handleOIDCCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Clear the state cookie
+	// Verify the state parameter matches (also serves as a CSRF check)
+	queryState := r.URL.Query().Get("state")
+	if queryState == "" || queryState != stateValue.State {
+		log.Printf("OIDC callback state mismatch")
+		http.Redirect(w, r, a.Config.Server.BaseURL+"/login?error=state_mismatch", http.StatusSeeOther)
+		return
+	}
+
+	// Prevent authorization code replay: mark this state as processed.
+	// If the callback is hit multiple times (browser pre-fetch, redirect loops, etc.),
+	// only the first request proceeds with the token exchange. Subsequent requests
+	// are harmless duplicates — redirect them home. The session cookie from the
+	// first (successful) callback will have been set by the time the browser follows
+	// this redirect, so the user lands on the dashboard.
+	if _, alreadyProcessed := a.processedOIDCStates.LoadOrStore(queryState, true); alreadyProcessed {
+		log.Printf("OIDC callback state already processed, redirecting home")
+		redirectTo := stateValue.RedirectTo
+		if redirectTo == "" {
+			redirectTo = a.Config.Server.BaseURL + "/"
+		}
+		http.Redirect(w, r, redirectTo, http.StatusSeeOther)
+		return
+	}
+
+	// Clear the state cookie (best effort — the server-side check above is the real guard)
 	http.SetCookie(w, &http.Cookie{
 		Name:     OIDC_STATE_COOKIE_NAME,
 		Value:    "",
@@ -278,14 +348,6 @@ func (a *application) handleOIDCCallback(w http.ResponseWriter, r *http.Request)
 		SameSite: http.SameSiteLaxMode,
 		HttpOnly: true,
 	})
-
-	// Verify the state parameter matches
-	queryState := r.URL.Query().Get("state")
-	if queryState == "" || queryState != stateValue.State {
-		log.Printf("OIDC callback state mismatch")
-		http.Redirect(w, r, a.Config.Server.BaseURL+"/login?error=state_mismatch", http.StatusSeeOther)
-		return
-	}
 
 	// Check for errors from the provider
 	if errorParam := r.URL.Query().Get("error"); errorParam != "" {
@@ -325,7 +387,15 @@ func (a *application) handleOIDCCallback(w http.ResponseWriter, r *http.Request)
 		oauth2.SetAuthURLParam("code_verifier", stateValue.CodeVerifier),
 	)
 	if err != nil {
-		log.Printf("OIDC token exchange failed for provider %q: %v", stateValue.ProviderName, err)
+		// Log detailed error info for debugging. oauth2.RetrieveError includes the
+		// response body from the provider, which often contains the specific failure reason.
+		var retrieveErr *oauth2.RetrieveError
+		if errors.As(err, &retrieveErr) {
+			log.Printf("OIDC token exchange failed for provider %q: status=%d, body=%s, err=%v",
+				stateValue.ProviderName, retrieveErr.Response.StatusCode, string(retrieveErr.Body), retrieveErr)
+		} else {
+			log.Printf("OIDC token exchange failed for provider %q: %v", stateValue.ProviderName, err)
+		}
 		http.Redirect(w, r, a.Config.Server.BaseURL+"/login?error=token_exchange_failed", http.StatusSeeOther)
 		return
 	}
@@ -376,6 +446,7 @@ func (a *application) handleOIDCCallback(w http.ResponseWriter, r *http.Request)
 		redirectTo = a.Config.Server.BaseURL + "/"
 	}
 
+	log.Printf("OIDC login successful for user %q via provider %q, redirecting to %q", username, stateValue.ProviderName, redirectTo)
 	http.Redirect(w, r, redirectTo, http.StatusSeeOther)
 }
 
@@ -410,18 +481,94 @@ func (a *application) ensureOIDCUser(username string) {
 	}
 	a.usernameHashToUsername[string(usernameHash)] = username
 
+	// Preserve OIDC-created users across config reloads (important for
+	// Kubernetes where ConfigMap mounts trigger spurious reloads).
+	addGlobalOIDCUser(username)
+
 	log.Printf("Auto-created OIDC user: %q", username)
+}
+
+// audienceClaim handles the JWT "aud" claim which can be a string or an array of strings.
+type audienceClaim []string
+
+func (a *audienceClaim) UnmarshalJSON(data []byte) error {
+	// Try string first
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		*a = []string{s}
+		return nil
+	}
+	// Try array of strings
+	var arr []string
+	if err := json.Unmarshal(data, &arr); err != nil {
+		return fmt.Errorf("aud: expected string or array of strings, got: %s", string(data))
+	}
+	*a = arr
+	return nil
+}
+
+func (a audienceClaim) contains(clientID string) bool {
+	for _, aud := range a {
+		if aud == clientID {
+			return true
+		}
+	}
+	return false
 }
 
 // oidcIDTokenClaims holds the claims we extract from the ID token.
 type oidcIDTokenClaims struct {
-	Issuer   string `json:"iss"`
-	Subject  string `json:"sub"`
-	Audience string `json:"aud"`
-	Expires  int64  `json:"exp"`
-	IssuedAt int64  `json:"iat"`
-	Nonce    string `json:"nonce"`
-	Email    string `json:"email"`
+	Issuer   string        `json:"iss"`
+	Subject  string        `json:"sub"`
+	Audience audienceClaim `json:"aud"`
+	Expires  int64         `json:"exp"`
+	IssuedAt int64         `json:"iat"`
+	Nonce    string        `json:"nonce"`
+	Email    string        `json:"email"`
+}
+
+// extractClaimAsStringList extracts a claim from the raw JWT payload and returns it as a
+// string slice. The claim value can be a single string or an array of strings.
+func extractClaimAsStringList(rawPayload []byte, claimName string) ([]string, error) {
+	var raw map[string]any
+	if err := json.Unmarshal(rawPayload, &raw); err != nil {
+		return nil, fmt.Errorf("unmarshaling raw claims: %w", err)
+	}
+
+	value, ok := raw[claimName]
+	if !ok {
+		return nil, nil
+	}
+
+	switch v := value.(type) {
+	case string:
+		return []string{v}, nil
+	case []any:
+		result := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				result = append(result, s)
+			}
+		}
+		return result, nil
+	default:
+		return nil, fmt.Errorf("claim %q has unexpected type %T", claimName, value)
+	}
+}
+
+// hasAnyMatchingGroup checks if the user belongs to at least one of the allowed groups.
+func hasAnyMatchingGroup(userGroups, allowedGroups []string) bool {
+	if len(allowedGroups) == 0 {
+		return true // no group restrictions configured
+	}
+	for _, allowed := range allowedGroups {
+		for _, userGroup := range userGroups {
+			if userGroup == allowed {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // verifyAndParseIDToken validates a raw JWT ID token and returns its claims.
@@ -432,7 +579,7 @@ func verifyAndParseIDToken(rawToken string, provider *OIDCProvider, expectedNonc
 		return nil, fmt.Errorf("invalid JWT format")
 	}
 
-	// Decode the header and payload (skip signature verification for now;
+	// Decode the payload (skip signature verification for now;
 	// the token was received directly from the provider's token endpoint over TLS).
 	// For a more complete implementation, verify the signature using the provider's JWKS.
 	payloadJSON, err := base64.RawURLEncoding.DecodeString(parts[1])
@@ -461,9 +608,9 @@ func verifyAndParseIDToken(rawToken string, provider *OIDCProvider, expectedNonc
 		return nil, fmt.Errorf("issuer mismatch: got %q, expected %q", claims.Issuer, expectedIssuer)
 	}
 
-	// 2. aud must include our client_id
-	if claims.Audience != clientID {
-		return nil, fmt.Errorf("audience mismatch: got %q, expected %q", claims.Audience, clientID)
+	// 2. aud must include our client_id (handles both string and array audiences)
+	if !claims.Audience.contains(clientID) {
+		return nil, fmt.Errorf("audience does not contain %q, got %v", clientID, []string(claims.Audience))
 	}
 
 	// 3. exp must be in the future
@@ -480,6 +627,18 @@ func verifyAndParseIDToken(rawToken string, provider *OIDCProvider, expectedNonc
 	// 5. nonce must match what we sent
 	if expectedNonce != "" && claims.Nonce != expectedNonce {
 		return nil, fmt.Errorf("nonce mismatch")
+	}
+
+	// 6. group claim validation (if configured)
+	if provider.GroupClaim != "" && len(provider.AllowedGroups) > 0 {
+		userGroups, err := extractClaimAsStringList(payloadJSON, provider.GroupClaim)
+		if err != nil {
+			return nil, fmt.Errorf("extracting group claim %q: %w", provider.GroupClaim, err)
+		}
+		if !hasAnyMatchingGroup(userGroups, provider.AllowedGroups) {
+			return nil, fmt.Errorf("user is not a member of any allowed group (claim %q, allowed: %v, user groups: %v)",
+				provider.GroupClaim, provider.AllowedGroups, userGroups)
+		}
 	}
 
 	return &claims, nil
